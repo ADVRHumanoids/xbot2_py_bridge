@@ -1,0 +1,119 @@
+#ifndef XBOT2_PyBridge_HAL_H
+#define XBOT2_PyBridge_HAL_H
+
+#include <xbot2/hal/device.h>
+#include <xbot2/hal/dev_joint.h>
+#include <xbot2/ipc/pipe.h>
+#include <sys/un.h>
+#include <nlohmann/json.hpp>
+
+
+namespace XBot {
+namespace Hal {
+
+class JointDriver : public DeviceDriverTpl<joint_rx, joint_tx>,
+                    private Journal
+{
+
+public:
+
+    XBOT2_DECLARE_SMART_PTR(JointDriver)
+
+    JointDriver(DeviceInfo dinfo, const Device::CommonParams& params);
+
+
+
+private:
+
+    JointSafety _safety;
+
+
+    // DeviceDriverTpl interface
+private:
+
+    bool sense_impl() override;
+    bool move_impl() override;
+    void on_tx_recv(const TxType &msg) override;
+
+    bool _init_done = false;
+    TxType _tx_tmp;
+    double _safe_kp, _safe_kd;
+};
+
+class PyBridgeDeviceContainer : public DeviceContainerBase
+{
+
+public:
+
+    PyBridgeDeviceContainer(std::vector<DeviceInfo> devinfo,
+                       const Device::CommonParams& params);
+
+
+    bool sense_all() override;
+    void run_all() override;
+    bool move_all() override;
+
+    bool send_string(const std::string& msg);
+    bool recv_string(std::string& msg, bool blocking = true);
+
+    ~PyBridgeDeviceContainer();
+
+private:
+
+    struct YamlParameter : public Parameter<YAML::Node>
+    {
+        YamlParameter(const std::string& name):
+            Parameter(name)
+        {}
+
+        void clear()
+        {
+            _valid = false;
+        }
+    };
+
+    struct JsonParameter : public Parameter<nlohmann::json>
+    {
+        JsonParameter(const std::string& name):
+            Parameter(name)
+        {}
+
+        void clear()
+        {
+            _valid = false;
+        }
+    };
+
+    // socket
+    int _socket_fd;
+    sockaddr_un _socket_local_addr;
+    sockaddr_un _socket_remote_addr;
+
+    // devs
+    std::vector<JointDriver::Ptr> _joints;
+
+    // recv thread
+    std::unique_ptr<thread> _recv_thread;
+    std::atomic_bool _recv_thread_run{true};
+
+    // thread-safe json
+    JsonParameter _recv_json;
+
+
+};
+
+class PyBridgeClientContainer : public DeviceContainer<JointClient>
+{
+
+public:
+
+    PyBridgeClientContainer(std::vector<DeviceInfo> devinfo,
+                       const Device::CommonParams& params);
+
+};
+
+}
+}
+
+
+#endif // PyBridge_HAL_H
