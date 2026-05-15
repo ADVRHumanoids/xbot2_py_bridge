@@ -154,6 +154,15 @@ class BridgeServer:
             print(f"[BridgeServer] Client at {addr} connected. Sent {len(self.joint_names)} joints, {len(self.imu_names)} IMUs.")
 
         elif data_type == 'control':
+            # drain
+            while True:
+                try:
+                    data, addr = self.sock.recvfrom(self.recv_buffer_size)
+                    self.max_bytes_received = max(self.max_bytes_received, len(data))
+                except BlockingIOError:
+                    break
+            if isinstance(data, (str, bytes)):
+                data = json.loads(data)
             return command_from_dict(data)
         else:
             print(f"[BridgeServer] Unknown data type received: {data_type}")
@@ -169,7 +178,7 @@ class BridgeServer:
         sockets_to_remove = []
         for client in self.clients:
             try:
-                self.sock.sendto(state_message, client)
+                ret = self.sock.sendto(state_message, client)
             except ConnectionRefusedError:
                 print(f"[BridgeServer] Client at {client} disconnected.")
                 sockets_to_remove.append(client)

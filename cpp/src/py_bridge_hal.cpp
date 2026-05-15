@@ -13,9 +13,11 @@
 
 XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceInfo> devinfo,
                                                   const Device::CommonParams &params)
-    : DeviceContainerBase(), _recv_json("__PyBridge_hal_recv_json")
+    : DeviceContainerBase(), 
+      Journal(Journal::no_publish, "PyBridge_hal"),
+      _recv_json("__PyBridge_hal_recv_json")
 {
-    Journal j("PyBridge_hal");
+    auto& j = *this;
 
     auto& pm = Context().paramManager();
 
@@ -86,7 +88,7 @@ XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceIn
     std::string response_str(40960, '\0');
     recv_string(response_str);
     auto response = nlohmann::json::parse(response_str);
-    j.jinfo("...got response");
+    j.jinfo("...got response {}", response_str);
 
 
     // get urdf
@@ -130,7 +132,29 @@ XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceIn
         j.jinfo("added joint '{}'", jname);
     }
 
-    // TBD imu and other devices
+    // imu
+    auto imu_names = response["imu_sensors"].get<std::vector<std::string>>();
+    for(auto iname : imu_names)
+    {
+        DeviceInfo dinfo;
+        dinfo.name = iname;
+        dinfo.type = "imu_PyBridge";
+        dinfo.id = -1;
+        auto dev = std::make_shared<ImuDriver>(dinfo, params);
+        addDevice(dev);
+        _imus.push_back(dev);
+        j.jinfo("added imu '{}'", iname);
+    }
+
+    // 
+    bool enable_simtime = true;
+    pm.getParam("/xbot/hal/py_bridge_hal/enable_sim_time", enable_simtime);
+    j.jinfo("simulated time is {}", enable_simtime ? "enabled" : "disabled");
+
+    if(!enable_simtime)
+    {
+        return;
+    }
 
     // enable sim time
     chrono::simulated_clock::enable_sim_time(true);
@@ -188,7 +212,7 @@ XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceIn
 bool XBot::Hal::PyBridgeDeviceContainer::sense_all()
 {
 
-    if(!_recv_json.isValid())
+    if(!receive_from_server())
     {
         return false;
     }
@@ -226,7 +250,20 @@ bool XBot::Hal::PyBridgeDeviceContainer::sense_all()
             rx.tor_ref = tauref[i];
         }
 
-        // TBD imu
+        // imu
+        for(auto& imu : _imus)
+        {
+            auto& rx = imu->rx();
+            auto& imu_state = response["imus"][imu->get_name()];
+            auto ang_vel_b = imu_state["ang_vel_b"].get<std::vector<double>>();
+            auto lin_acc_b = imu_state["lin_acc_b"].get<std::vector<double>>();
+            auto quat_w = imu_state["quat_w"].get<std::vector<double>>();
+            
+            std::memcpy(rx.angular_velocity, ang_vel_b.data(), 3*sizeof(double));
+            std::memcpy(rx.linear_acceleration, lin_acc_b.data(), 3*sizeof(double));
+            std::memcpy(rx.orientation, quat_w.data(), 4*sizeof(double));
+
+        }
     }
 
     DeviceContainerBase::sense_all();
@@ -306,19 +343,73 @@ bool XBot::Hal::PyBridgeDeviceContainer::recv_string(std::string &msg, bool bloc
     }
 }
 
+bool XBot::Hal::PyBridgeDeviceContainer::receive_from_server()
+{
+    if(_recv_thread)
+    {
+        return _recv_json.isValid();
+    }
+
+    // check for message
+    std::string response_str(40960, '\0');
+    if(!recv_string(response_str, false))
+    {
+        return false;
+    }
+
+    // keep only most recent
+    while(true)
+    {
+        response_str.resize(40960);
+        if(!recv_string(response_str, false))
+        {
+            break;
+        }
+    }
+
+    // parse json
+    nlohmann::json response = nlohmann::json::parse(response_str);
+
+    // set response
+    _recv_json.set_value(response);
+    
+    // success
+    return true;
+
+}
+
+
 XBot::Hal::PyBridgeDeviceContainer::~PyBridgeDeviceContainer()
 {
     _recv_thread_run = false;
-    _recv_thread->join();
+    
+    if(_recv_thread)
+    {
+        _recv_thread->join();       
+    }
 }
 
 
 
 XBot::Hal::PyBridgeClientContainer::PyBridgeClientContainer(std::vector<DeviceInfo> devinfo,
                                                   const Device::CommonParams &params):
-    DeviceContainer(devinfo, params)
+    DeviceContainerBase()
 {
+    // loop over devinfo and create clients
 
+    for(auto& dinfo : devinfo)
+    {
+        if(dinfo.type == "joint_PyBridge")
+        {
+            auto dev = std::make_shared<JointClient>(dinfo, params);
+            addDevice(dev);
+        }
+        else if(dinfo.type == "imu_PyBridge")
+        {
+            auto dev = std::make_shared<ImuClient>(dinfo, params);
+            addDevice(dev);
+        }
+    }
 }
 
 
@@ -433,5 +524,23 @@ void XBot::Hal::JointDriver::on_tx_recv(const TxType &msg)
     _tx_tmp.apply(msg);
 }
 
+Eigen::Vector3d XBot::Hal::ImuClient::getAngularVelocity() const
+{
+    return Eigen::Vector3d(_rx.angular_velocity[0],
+                           _rx.angular_velocity[1],
+                           _rx.angular_velocity[2]);
+}
+
+Eigen::Vector3d XBot::Hal::ImuClient::getLinearAcceleration() const
+{
+    return Eigen::Vector3d(_rx.linear_acceleration[0],
+                           _rx.linear_acceleration[1],
+                           _rx.linear_acceleration[2]);
+}
+
+Eigen::Quaterniond XBot::Hal::ImuClient::getOrientation() const
+{
+    return Eigen::Quaterniond(_rx.orientation[3], _rx.orientation[0], _rx.orientation[1], _rx.orientation[2]);
+}
 
 XBOT2_REGISTER_DEVICE(XBot::Hal::PyBridgeDeviceContainer, XBot::Hal::PyBridgeClientContainer, py_bridge_hal)
