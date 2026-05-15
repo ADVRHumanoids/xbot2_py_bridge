@@ -12,7 +12,10 @@ license = { text = "LGPL-3.0-or-later" }
 authors = [
     { name = "IIT" },
 ]
-dependencies = []
+dependencies = [
+    "numpy>=1.21",
+    "PyYAML>=5.4",
+]
 
 [project.optional-dependencies]
 dev = [
