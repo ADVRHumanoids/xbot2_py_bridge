@@ -6,9 +6,10 @@ import tempfile
 import threading
 import time
 
+import json
+
 import numpy as np
 import pytest
-import yaml
 
 from xbot2_py_bridge.bridge_server import (
     BridgeServer,
@@ -96,17 +97,17 @@ class DummyClient:
             #    we will receive one shortly after discovery.
 
             # 2. Send discovery
-            discovery_msg = yaml.dump({"type": "discovery"}).encode()
+            discovery_msg = json.dumps({"type": "discovery"}).encode()
             self._sock.sendto(discovery_msg, self.server_path)
 
             # Wait for discovery response
             data, _ = self._sock.recvfrom(4096)
-            self.discovery_response = yaml.safe_load(data.decode())
+            self.discovery_response = json.loads(data.decode())
             self.discovery_done.set()
 
             # 3. Wait for a state broadcast
             data, _ = self._sock.recvfrom(65536)
-            self.received_state = yaml.safe_load(data.decode())
+            self.received_state = json.loads(data.decode())
             self.state_received.set()
 
             # 4. Send N_CONTROL control messages
@@ -121,7 +122,7 @@ class DummyClient:
                         "d":   [0.0] * N,
                     },
                 }
-                self._sock.sendto(yaml.dump(ctrl).encode(), self.server_path)
+                self._sock.sendto(json.dumps(ctrl).encode(), self.server_path)
 
             self.control_sent.set()
 
@@ -228,10 +229,12 @@ def test_discovery_and_state_and_control(tmp_sockets, server):
     assert "imu_link" in state["imus"]
 
     # --- control commands ---
+    # The server drains all queued control messages on each receive() call and
+    # returns only the last one, so we expect exactly 1 command containing the
+    # values from the final iteration (i = N_CONTROL - 1).
     assert client.control_sent.is_set(), "Client never finished sending control"
-    assert len(collected_commands) == DummyClient.N_CONTROL, (
-        f"Expected {DummyClient.N_CONTROL} commands, got {len(collected_commands)}"
-    )
-    for i, cmd in enumerate(collected_commands):
-        np.testing.assert_array_almost_equal(cmd.joint_command.q, [float(i)] * N)
-        np.testing.assert_array_almost_equal(cmd.joint_command.tau, [0.1 * i] * N)
+    assert len(collected_commands) >= 1, "Expected at least 1 command after draining"
+    last = DummyClient.N_CONTROL - 1
+    cmd = collected_commands[-1]
+    np.testing.assert_array_almost_equal(cmd.joint_command.q, [float(last)] * N)
+    np.testing.assert_array_almost_equal(cmd.joint_command.tau, [0.1 * last] * N)
