@@ -1,4 +1,5 @@
-[![Tests](https://github.com/ADVRHumanoids/xbot2_py_bridge/actions/workflows/test.yml/badge.svg)](https://github.com/ADVRHumanoids/xbot2_py_bridge/actions/workflows/test.yml)# xbot2_py_bridge
+[![Tests](https://github.com/ADVRHumanoids/xbot2_py_bridge/actions/workflows/test.yml/badge.svg)](https://github.com/ADVRHumanoids/xbot2_py_bridge/actions/workflows/test.yml)
+# xbot2_py_bridge
 
 Python bridge for XBot2.
 
