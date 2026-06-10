@@ -1,9 +1,11 @@
 import os
 import socket
-import json, yaml
+import json
 import numpy as np
 from dataclasses import dataclass, fields, is_dataclass
 from typing import get_type_hints, get_origin, get_args
+
+from .shm_protocol import ShmBridgeMemory
 
 @dataclass
 class JointCommand:
@@ -86,7 +88,9 @@ class BridgeServer:
                  socket_path: str = None,
                  joint_names: list[str] = [],
                  imu_names: list[str] = [],
-                 recv_buffer_size: int = 4096
+                 recv_buffer_size: int = 4096,
+                 protocol: str = "shm",
+                 command_freshness_sec: float = 0.1,
                  ):
         
         # Initialize the server socket path
@@ -110,9 +114,23 @@ class BridgeServer:
         # Store the joint and IMU names for later use
         self.joint_names = joint_names
         self.imu_names = imu_names
+        self.protocol = protocol
+        self.command_freshness_sec = command_freshness_sec
+
+        if self.protocol not in ("shm", "json"):
+            raise ValueError(f"Unsupported bridge protocol '{self.protocol}'")
+
+        self._shm = None
+        if self.protocol == "shm":
+            self._shm = ShmBridgeMemory(name, self.joint_names, self.imu_names)
+            self.state = self._shm.state
+            self.command = self._shm.command
+        else:
+            self.state = None
+            self.command = None
 
         # Print info
-        print(f"[BridgeServer] Initialized on socket {self.server_socket_path}")
+        print(f"[BridgeServer] Initialized on socket {self.server_socket_path} using {self.protocol}")
         print(f"[BridgeServer] Joint names: {self.joint_names}")
         print(f"[BridgeServer] IMU names: {self.imu_names}")
 
@@ -124,7 +142,22 @@ class BridgeServer:
         self.max_bytes_sent = 0
 
 
-    def receive(self) -> RobotCommand | None:
+    def _handle_discovery(self, addr):
+        print(f"[BridgeServer] Discovery request received from {addr}. Sending joint and IMU info.")
+        response = {'type': 'discovery'}
+        response['joint_names'] = self.joint_names
+        response['imu_sensors'] = list(self.imu_names)
+        if self._shm is not None:
+            self._shm.invalidate_command()
+            response.update(self._shm.discovery_payload())
+        try:
+            self.sock.sendto(json.dumps(response).encode('utf-8'), addr)
+        except Exception as e:
+            print(f"[BridgeServer] Error sending discovery response to {addr}: {e}")
+        self.clients.add(addr)
+        print(f"[BridgeServer] Client at {addr} connected. Sent {len(self.joint_names)} joints, {len(self.imu_names)} IMUs.")
+
+    def _receive_json(self) -> RobotCommand | None:
         """Receive a command from any client."""
         try:
             # Receive data from any client (non-blocking)
@@ -142,16 +175,7 @@ class BridgeServer:
         data_type = data['type']
 
         if data_type == 'discovery':
-            print(f"[BridgeServer] Discovery request received from {addr}. Sending joint and IMU info.")
-            response = {'type': 'discovery'}
-            response['joint_names'] = self.joint_names
-            response['imu_sensors'] = list(self.imu_names)
-            try:
-                self.sock.sendto(json.dumps(response).encode('utf-8'), addr)
-            except Exception as e:
-                print(f"[BridgeServer] Error sending discovery response to {addr}: {e}")
-            self.clients.add(addr)
-            print(f"[BridgeServer] Client at {addr} connected. Sent {len(self.joint_names)} joints, {len(self.imu_names)} IMUs.")
+            self._handle_discovery(addr)
 
         elif data_type == 'control':
             # drain
@@ -167,9 +191,56 @@ class BridgeServer:
         else:
             print(f"[BridgeServer] Unknown data type received: {data_type}")
 
-    
+    def _poll_socket_control_plane(self):
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(self.recv_buffer_size)
+                self.max_bytes_received = max(self.max_bytes_received, len(data))
+                data = json.loads(data)
+            except BlockingIOError:
+                return
+
+            data_type = data.get('type')
+            if data_type == 'discovery':
+                self._handle_discovery(addr)
+            else:
+                print(f"[BridgeServer] Ignoring {data_type!r} message in shm mode")
+
+    def receive(self):
+        if self.protocol == "json":
+            return self._receive_json()
+
+        self._poll_socket_control_plane()
+        if not self.clients:
+            return False
+
+        return self._shm.has_new_command(self.command_freshness_sec)
+
+    def commit_state(self, time: float):
+        if self.protocol != "shm":
+            raise RuntimeError("commit_state() is only available with protocol='shm'")
+        self._shm.commit_state(time)
+
     def send_state(self, state: RobotState):
         """Send the current state to all connected clients."""
+        if self.protocol == "shm":
+            js = state.joints
+            self.state.joints.q[:] = js.q
+            self.state.joints.dq[:] = js.dq
+            self.state.joints.tau[:] = js.tau
+            self.state.joints.k[:] = js.k
+            self.state.joints.d[:] = js.d
+            self.state.joints.qref[:] = js.qref
+            self.state.joints.vref[:] = js.vref
+            self.state.joints.tauref[:] = js.tauref
+            for name, imu_state in state.imus.items():
+                imu = self.state.imus[name]
+                imu.quat_w[:] = imu_state.quat_w
+                imu.lin_acc_b[:] = imu_state.lin_acc_b
+                imu.ang_vel_b[:] = imu_state.ang_vel_b
+            self.commit_state(state.time)
+            return
+
         state_dict = state_to_dict(state)
         state_dict['type'] = 'state'
         state_message = json.dumps(state_dict, separators=(',', ':')).encode('utf-8')
@@ -187,3 +258,15 @@ class BridgeServer:
         for socket in sockets_to_remove:
             self.clients.remove(socket)
 
+    def close(self):
+        self.sock.close()
+        self.state = None
+        self.command = None
+        if self._shm is not None:
+            self._shm.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

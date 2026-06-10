@@ -6,11 +6,57 @@
 #include <xbot2/hal/dev_imu.h>
 #include <xbot2/ipc/pipe.h>
 #include <sys/un.h>
-#include <nlohmann/json.hpp>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 
 
 namespace XBot {
 namespace Hal {
+
+namespace PyBridgeShm {
+
+// Keep this ABI in sync with python/src/xbot2_py_bridge/shm_protocol.py.
+// The hot path is intentionally just a fixed header followed by packed
+// float64 arrays, so both C++ and Python can index the same memory directly.
+constexpr uint64_t MAGIC = 0x5842504253484D31ULL; // XBPBSHM1
+constexpr uint64_t VERSION = 1;
+constexpr size_t HEADER_WORDS = 16;
+constexpr size_t HEADER_SIZE = HEADER_WORDS * sizeof(uint64_t);
+constexpr size_t STATE_FIELD_COUNT = 8;
+constexpr size_t COMMAND_FIELD_COUNT = 5;
+
+// Header words are uint64_t to keep the layout simple and naturally aligned.
+// STATE_SEQ and COMMAND_SEQ implement a seqlock: odd means "writer active",
+// even means "stable snapshot".
+enum HeaderIndex : size_t
+{
+    IDX_MAGIC = 0,
+    IDX_VERSION,
+    IDX_HEADER_SIZE,
+    IDX_TOTAL_SIZE,
+    IDX_NJOINTS,
+    IDX_NIMUS,
+    IDX_STATE_SEQ,
+    IDX_COMMAND_SEQ,
+    IDX_SERVER_SESSION_ID,
+    IDX_CLIENT_SESSION_ID,
+    IDX_COMMAND_VALID,
+    IDX_STATE_OFFSET,
+    IDX_COMMAND_OFFSET,
+    IDX_COMMAND_STAMP_NS,
+    IDX_RESERVED0,
+    IDX_RESERVED1,
+};
+
+struct Header
+{
+    uint64_t words[HEADER_WORDS];
+};
+
+static_assert(sizeof(Header) == HEADER_SIZE);
+
+}
 
 // 1. define driver classes for each device
 // they are responsible for registering resources, implementing safety reactions, 
@@ -97,20 +143,15 @@ public:
     ~PyBridgeDeviceContainer();
 
 private:
+    bool read_state_from_shm();
+    void map_shared_memory(const std::string& shm_name,
+                           uint64_t expected_server_session_id);
+    void init_shm_views();
 
-    struct JsonParameter : public Parameter<nlohmann::json>
-    {
-        JsonParameter(const std::string& name):
-            Parameter(name)
-        {}
-
-        void clear()
-        {
-            _valid = false;
-        }
-    };
-
-    bool receive_from_server();
+    // Sim time is updated outside sense_all(); the control thread may use the
+    // simulated clock for synchronization while sense_all() is running.
+    void sim_time_thread_main();
+    uint64_t generate_client_session_id() const;
 
     // socket
     int _socket_fd;
@@ -121,12 +162,47 @@ private:
     std::vector<JointDriver::Ptr> _joints;
     std::vector<ImuDriver::Ptr> _imus;
 
-    // recv thread
+    // sim-time update thread
     std::unique_ptr<thread> _recv_thread;
     std::atomic_bool _recv_thread_run{true};
 
-    // thread-safe json
-    JsonParameter _recv_json;
+    // Shared-memory ownership remains on the Python server. The HAL only maps
+    // the segment advertised during discovery and validates the session id.
+    int _shm_fd = -1;
+    void * _shm_addr = nullptr;
+    size_t _shm_size = 0;
+    PyBridgeShm::Header * _shm_header = nullptr;
+    uint64_t _server_session_id = 0;
+    uint64_t _client_session_id = 0;
+    uint64_t _last_state_seq = 0;
+
+    const double * _state_time = nullptr;
+
+    // Direct views into the state and command frames. Field order is fixed by
+    // STATE_FIELD_COUNT/COMMAND_FIELD_COUNT and mirrored in shm_protocol.py.
+    std::array<const double *, PyBridgeShm::STATE_FIELD_COUNT> _state_joint{};
+    struct ImuStateView
+    {
+        const double * quat_w = nullptr;
+        const double * lin_acc_b = nullptr;
+        const double * ang_vel_b = nullptr;
+    };
+    std::vector<ImuStateView> _state_imus;
+    std::array<double *, PyBridgeShm::COMMAND_FIELD_COUNT> _command_joint{};
+
+    // Scratch buffers let read_state_from_shm() validate the seqlock before
+    // touching HAL device rx fields; torn reads are discarded cleanly.
+    std::array<std::vector<double>, PyBridgeShm::STATE_FIELD_COUNT> _state_joint_tmp;
+    struct ImuStateBuffer
+    {
+        double quat_w[4];
+        double lin_acc_b[3];
+        double ang_vel_b[3];
+    };
+    std::vector<ImuStateBuffer> _state_imu_tmp;
+
+    bool _enable_simtime = true;
+    bool _time_initialized = false;
 
 
 };

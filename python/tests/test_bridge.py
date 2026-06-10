@@ -10,12 +10,23 @@ import json
 
 import numpy as np
 import pytest
+from multiprocessing import shared_memory
 
 from xbot2_py_bridge.bridge_server import (
     BridgeServer,
     ImuState,
     JointState,
     RobotState,
+)
+from xbot2_py_bridge.shm_protocol import (
+    COMMAND_FIELDS,
+    HEADER_FORMAT,
+    IDX_CLIENT_SESSION_ID,
+    IDX_COMMAND_SEQ,
+    IDX_COMMAND_STAMP_NS,
+    IDX_COMMAND_VALID,
+    IDX_SERVER_SESSION_ID,
+    make_layout,
 )
 
 # ---------------------------------------------------------------------------
@@ -164,9 +175,10 @@ def server(tmp_sockets):
         socket_path=server_path,   # already formatted — no {name} placeholder
         joint_names=JOINT_NAMES,
         imu_names=IMU_NAMES,
+        protocol="json",
     )
     yield srv
-    srv.sock.close()
+    srv.close()
     if os.path.exists(server_path):
         os.unlink(server_path)
 
@@ -238,3 +250,143 @@ def test_discovery_and_state_and_control(tmp_sockets, server):
     cmd = collected_commands[-1]
     np.testing.assert_array_almost_equal(cmd.joint_command.q, [float(last)] * N)
     np.testing.assert_array_almost_equal(cmd.joint_command.tau, [0.1 * last] * N)
+
+
+def test_shm_layout_and_state_views(tmp_path):
+    server_path = str(tmp_path / "server.sock")
+    srv = BridgeServer(
+        name="test",
+        socket_path=server_path,
+        joint_names=JOINT_NAMES,
+        imu_names=IMU_NAMES,
+    )
+    try:
+        layout = make_layout(N, len(IMU_NAMES))
+        assert srv._shm.layout == layout
+        assert srv._shm.name.startswith("xbot2-pybridge-test-")
+
+        srv.state.joints.q[:] = [1.0, 2.0, 3.0]
+        srv.state.imus.imu_link.lin_acc_b[:] = [0.0, 0.0, 9.81]
+        srv.commit_state(4.2)
+
+        assert srv._shm.state_time[0] == pytest.approx(4.2)
+        np.testing.assert_array_equal(srv.state.joints.q, [1.0, 2.0, 3.0])
+        np.testing.assert_array_equal(srv.state.imus["imu_link"].lin_acc_b, [0.0, 0.0, 9.81])
+    finally:
+        srv.close()
+
+
+def test_shm_discovery_exposes_session_and_layout(tmp_path):
+    server_path = str(tmp_path / "server.sock")
+    client_path = str(tmp_path / "client.sock")
+    srv = BridgeServer("test", server_path, JOINT_NAMES, IMU_NAMES)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.bind(client_path)
+        sock.settimeout(TIMEOUT)
+        sock.sendto(json.dumps({"type": "discovery"}).encode(), server_path)
+
+        deadline = time.monotonic() + TIMEOUT
+        while time.monotonic() < deadline:
+            srv.receive()
+            try:
+                data, _ = sock.recvfrom(4096)
+                break
+            except socket.timeout:
+                pytest.fail("timed out waiting for discovery response")
+
+        response = json.loads(data.decode())
+        assert response["protocol"] == "xbot2-shm-v1"
+        assert response["shm_name"] == srv._shm.name
+        assert response["server_session_id"] == srv._shm.server_session_id
+        assert response["layout"]["njoints"] == N
+        assert response["layout"]["nimus"] == len(IMU_NAMES)
+    finally:
+        sock.close()
+        srv.close()
+
+
+def _write_command(shm_name, server_session_id, client_session_id, values, *, stamp_ns=None):
+    shm = shared_memory.SharedMemory(name=shm_name)
+    try:
+        header = list(struct_unpack_header(shm.buf))
+        command_offset = header[12]
+        seq = header[IDX_COMMAND_SEQ]
+        if seq & 1:
+            seq += 1
+        header[IDX_COMMAND_SEQ] = seq + 1
+        struct_pack_header(shm.buf, header)
+
+        pos = command_offset
+        for field in COMMAND_FIELDS:
+            arr = np.ndarray((N,), dtype=np.float64, buffer=shm.buf, offset=pos)
+            arr[:] = values[field]
+            pos += N * 8
+        del arr
+
+        header[IDX_SERVER_SESSION_ID] = server_session_id
+        header[IDX_CLIENT_SESSION_ID] = client_session_id
+        header[IDX_COMMAND_VALID] = 1
+        header[IDX_COMMAND_STAMP_NS] = stamp_ns if stamp_ns is not None else time.monotonic_ns()
+        header[IDX_COMMAND_SEQ] = seq + 2
+        struct_pack_header(shm.buf, header)
+    finally:
+        shm.close()
+
+
+def struct_unpack_header(buffer):
+    import struct
+    return struct.unpack_from(HEADER_FORMAT, buffer, 0)
+
+
+def struct_pack_header(buffer, header):
+    import struct
+    struct.pack_into(HEADER_FORMAT, buffer, 0, *header)
+
+
+def test_shm_receive_accepts_fresh_current_session_command(tmp_path):
+    server_path = str(tmp_path / "server.sock")
+    srv = BridgeServer("test", server_path, JOINT_NAMES, IMU_NAMES)
+    try:
+        _write_command(
+            srv._shm.name,
+            srv._shm.server_session_id,
+            12345,
+            {
+                "q": [1.0, 2.0, 3.0],
+                "dq": [0.1, 0.2, 0.3],
+                "tau": [4.0, 5.0, 6.0],
+                "k": [7.0, 8.0, 9.0],
+                "d": [10.0, 11.0, 12.0],
+            },
+        )
+
+        assert srv._shm.has_new_command(1.0)
+        np.testing.assert_array_equal(srv.command.joints.q, [1.0, 2.0, 3.0])
+        np.testing.assert_array_equal(srv.command.joints.tau, [4.0, 5.0, 6.0])
+    finally:
+        srv.close()
+
+
+def test_shm_rejects_stale_or_wrong_session_command(tmp_path):
+    server_path = str(tmp_path / "server.sock")
+    srv = BridgeServer("test", server_path, JOINT_NAMES, IMU_NAMES)
+    try:
+        _write_command(
+            srv._shm.name,
+            srv._shm.server_session_id + 1,
+            12345,
+            {field: [0.0] * N for field in COMMAND_FIELDS},
+        )
+        assert not srv._shm.has_new_command(1.0)
+
+        _write_command(
+            srv._shm.name,
+            srv._shm.server_session_id,
+            12345,
+            {field: [0.0] * N for field in COMMAND_FIELDS},
+            stamp_ns=time.monotonic_ns() - 10_000_000_000,
+        )
+        assert not srv._shm.has_new_command(0.001)
+    finally:
+        srv.close()
