@@ -2,20 +2,23 @@
 #include <yaml-cpp/yaml.h>
 #include <nlohmann/json.hpp>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <chrono>
+#include <random>
+#include <thread>
 
 #include <xbot2_interface/xbotinterface2.h>
 
 XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceInfo> devinfo,
                                                   const Device::CommonParams &params)
     : DeviceContainerBase(), 
-      Journal(Journal::no_publish, "PyBridge_hal"),
-      _recv_json("__PyBridge_hal_recv_json")
+      Journal(Journal::no_publish, "PyBridge_hal")
 {
     auto& j = *this;
 
@@ -60,7 +63,8 @@ XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceIn
     }
 
 
-    // discovery
+    // Discovery is the only JSON/control-plane exchange in shm mode. It gives
+    // us the device list plus the unique shm name and server session id.
     nlohmann::json discovery_msg;
     discovery_msg["type"] = "discovery";
     const std::string discovery_str = discovery_msg.dump();
@@ -89,6 +93,15 @@ XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceIn
     recv_string(response_str);
     auto response = nlohmann::json::parse(response_str);
     j.jinfo("...got response {}", response_str);
+
+    const auto protocol = response.value("protocol", std::string{});
+    if(protocol != "xbot2-shm-v1")
+    {
+        throw std::runtime_error("PyBridge server does not support xbot2-shm-v1");
+    }
+
+    const std::string shm_name = response.at("shm_name").get<std::string>();
+    const uint64_t server_session_id = response.at("server_session_id").get<uint64_t>();
 
 
     // get urdf
@@ -146,12 +159,16 @@ XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceIn
         j.jinfo("added imu '{}'", iname);
     }
 
-    // 
-    bool enable_simtime = true;
-    pm.getParam("/xbot/hal/py_bridge_hal/enable_sim_time", enable_simtime);
-    j.jinfo("simulated time is {}", enable_simtime ? "enabled" : "disabled");
+    // Devices are known now, so validate the shm header counts against the HAL
+    // device vectors before creating raw array views into the segment.
+    map_shared_memory(shm_name, server_session_id);
+    init_shm_views();
 
-    if(!enable_simtime)
+    // 
+    pm.getParam("/xbot/hal/py_bridge_hal/enable_sim_time", _enable_simtime);
+    j.jinfo("simulated time is {}", _enable_simtime ? "enabled" : "disabled");
+
+    if(!_enable_simtime)
     {
         return;
     }
@@ -159,111 +176,18 @@ XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceIn
     // enable sim time
     chrono::simulated_clock::enable_sim_time(true);
 
-    // thread for reading sim state and setting sim time
-    _recv_thread = std::make_unique<thread>([this]()
-    {
-        this_thread::set_name("py_bridge");
-
-        bool time_initialized = false;
-
-        while(_recv_thread_run.load())
-        {
-            // wait for message
-            std::string response_str(40960, '\0');
-
-            if(!recv_string(response_str, true))
-            {
-                continue;
-            }
-
-            // keep only most recent
-            while(true)
-            {
-                response_str.resize(40960);
-                if(!recv_string(response_str, false))
-                {
-                    break;
-                }
-            }
-
-            // parse json
-            nlohmann::json response = nlohmann::json::parse(response_str);
-
-            // handle simulation time
-            double time = response["time"].get<double>();
-
-            if(!time_initialized)
-            {
-                time_initialized = true;
-                chrono::simulated_clock::initialize(std::chrono::nanoseconds(int64_t(time*1e9)));
-            }
-
-            chrono::simulated_clock::set_time(std::chrono::nanoseconds(int64_t(time*1e9)));
-
-            // set response
-            _recv_json.set_value(response);
-        }
-
-        chrono::simulated_clock::enable_sim_time(false);
-    });
+    // Keep sim-time updates outside sense_all(); the control thread may use the
+    // same simulated clock for synchronization while sense_all() is running.
+    _recv_thread = std::make_unique<thread>(&PyBridgeDeviceContainer::sim_time_thread_main, this);
 
 }
 
 bool XBot::Hal::PyBridgeDeviceContainer::sense_all()
 {
 
-    if(!receive_from_server())
+    if(!read_state_from_shm())
     {
         return false;
-    }
-
-    nlohmann::json response;
-    _recv_json.get_value(response);
-    _recv_json.clear();
-
-    auto type = response["type"].get<std::string>();
-
-    if(type == "state")
-    {
-        // joints
-        auto& js = response["joints"];
-
-        auto q    = js["q"].get<std::vector<double>>();
-        auto dq   = js["dq"].get<std::vector<double>>();
-        auto tau  = js["tau"].get<std::vector<double>>();
-        auto k    = js["k"].get<std::vector<double>>();
-        auto d    = js["d"].get<std::vector<double>>();
-        auto qref = js["qref"].get<std::vector<double>>();
-        auto vref = js["vref"].get<std::vector<double>>();
-        auto tauref = js["tauref"].get<std::vector<double>>();
-
-        for(int i = 0; i < _joints.size(); i++)
-        {
-            auto& rx = _joints[i]->rx();
-            rx.link_pos = rx.motor_pos = q[i];
-            rx.link_vel = rx.motor_vel = dq[i];
-            rx.torque = tau[i];
-            rx.gain_kp = k[i];
-            rx.gain_kd = d[i];
-            rx.pos_ref = qref[i];
-            rx.vel_ref = vref[i];
-            rx.tor_ref = tauref[i];
-        }
-
-        // imu
-        for(auto& imu : _imus)
-        {
-            auto& rx = imu->rx();
-            auto& imu_state = response["imus"][imu->get_name()];
-            auto ang_vel_b = imu_state["ang_vel_b"].get<std::vector<double>>();
-            auto lin_acc_b = imu_state["lin_acc_b"].get<std::vector<double>>();
-            auto quat_w = imu_state["quat_w"].get<std::vector<double>>();
-            
-            std::memcpy(rx.angular_velocity, ang_vel_b.data(), 3*sizeof(double));
-            std::memcpy(rx.linear_acceleration, lin_acc_b.data(), 3*sizeof(double));
-            std::memcpy(rx.orientation, quat_w.data(), 4*sizeof(double));
-
-        }
     }
 
     DeviceContainerBase::sense_all();
@@ -280,31 +204,47 @@ bool XBot::Hal::PyBridgeDeviceContainer::move_all()
 {
     DeviceContainerBase::move_all();
 
-    // prepare command message as JSON
-    nlohmann::json command_msg;
-    command_msg["type"] = "control";
-
-    auto& jc = command_msg["joint_command"];
-    auto& q   = jc["q"]   = nlohmann::json::array();
-    auto& dq  = jc["dq"]  = nlohmann::json::array();
-    auto& tau = jc["tau"] = nlohmann::json::array();
-    auto& k   = jc["k"]   = nlohmann::json::array();
-    auto& d   = jc["d"]   = nlohmann::json::array();
-
-    for(auto& j : _joints)
-    {
-        auto& tx = j->tx();
-        q.push_back(tx.pos_ref);
-        dq.push_back(tx.vel_ref);
-        tau.push_back(tx.tor_ref);
-        k.push_back(tx.gain_kp);
-        d.push_back(tx.gain_kd);
-    }
-
-    if(!send_string(command_msg.dump()))
+    if(!_shm_header)
     {
         return false;
     }
+
+    using namespace PyBridgeShm;
+
+    // Publish command with a seqlock:
+    // 1. make COMMAND_SEQ odd so Python sees the frame as unstable,
+    // 2. write payload and session metadata,
+    // 3. make COMMAND_SEQ even to publish a complete snapshot.
+    uint64_t seq = _shm_header->words[IDX_COMMAND_SEQ];
+    if(seq & 1)
+    {
+        seq++;
+    }
+
+    _shm_header->words[IDX_COMMAND_SEQ] = seq + 1;
+
+    // Fixed command frame order: q, dq, tau, k, d. We always publish full
+    // commands, so reconnects never depend on stale masked/partial values.
+    for(size_t i = 0; i < _joints.size(); i++)
+    {
+        auto& tx = _joints[i]->tx();
+        _command_joint[0][i] = tx.pos_ref;
+        _command_joint[1][i] = tx.vel_ref;
+        _command_joint[2][i] = tx.tor_ref;
+        _command_joint[3][i] = tx.gain_kp;
+        _command_joint[4][i] = tx.gain_kd;
+    }
+
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+
+    // Session ids and monotonic timestamp are stale-command defense. The server
+    // rejects commands from old mappings, old clients, or old ticks.
+    _shm_header->words[IDX_SERVER_SESSION_ID] = _server_session_id;
+    _shm_header->words[IDX_CLIENT_SESSION_ID] = _client_session_id;
+    _shm_header->words[IDX_COMMAND_STAMP_NS] = static_cast<uint64_t>(now_ns);
+    _shm_header->words[IDX_COMMAND_VALID] = 1;
+    _shm_header->words[IDX_COMMAND_SEQ] = seq + 2;
 
     return true;
 }
@@ -343,39 +283,240 @@ bool XBot::Hal::PyBridgeDeviceContainer::recv_string(std::string &msg, bool bloc
     }
 }
 
-bool XBot::Hal::PyBridgeDeviceContainer::receive_from_server()
+uint64_t XBot::Hal::PyBridgeDeviceContainer::generate_client_session_id() const
 {
-    if(_recv_thread)
+    std::random_device rd;
+    uint64_t hi = static_cast<uint64_t>(rd()) << 32;
+    uint64_t lo = static_cast<uint64_t>(rd());
+    uint64_t ret = hi ^ lo ^ static_cast<uint64_t>(getpid());
+    return ret == 0 ? 1 : ret;
+}
+
+void XBot::Hal::PyBridgeDeviceContainer::map_shared_memory(const std::string& shm_name,
+                                                           uint64_t expected_server_session_id)
+{
+    using namespace PyBridgeShm;
+
+    // Python's SharedMemory name has no leading slash, while shm_open() wants
+    // the POSIX form. Accept either to keep discovery payloads simple.
+    std::string posix_name = shm_name;
+    if(posix_name.empty())
     {
-        return _recv_json.isValid();
+        throw std::runtime_error("empty py_bridge shm name");
+    }
+    if(posix_name.front() != '/')
+    {
+        posix_name.insert(posix_name.begin(), '/');
     }
 
-    // check for message
-    std::string response_str(40960, '\0');
-    if(!recv_string(response_str, false))
+    _shm_fd = shm_open(posix_name.c_str(), O_RDWR, 0);
+    if(_shm_fd == -1)
+    {
+        throw std::runtime_error("unable to open py_bridge shm '" + posix_name + "': " + std::string(strerror(errno)));
+    }
+
+    struct stat fd_stat;
+    if(fstat(_shm_fd, &fd_stat) == -1)
+    {
+        throw std::runtime_error("unable to stat py_bridge shm '" + posix_name + "': " + std::string(strerror(errno)));
+    }
+    _shm_size = static_cast<size_t>(fd_stat.st_size);
+
+    _shm_addr = mmap(nullptr, _shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, _shm_fd, 0);
+    if(_shm_addr == MAP_FAILED)
+    {
+        _shm_addr = nullptr;
+        throw std::runtime_error("unable to map py_bridge shm '" + posix_name + "': " + std::string(strerror(errno)));
+    }
+
+    if(_shm_size < HEADER_SIZE)
+    {
+        throw std::runtime_error("py_bridge shm is smaller than header");
+    }
+
+    _shm_header = reinterpret_cast<Header *>(_shm_addr);
+
+    // Validate the ABI before storing any persistent pointers into the segment.
+    // A mismatch here means the C++ and Python packages are out of sync.
+    if(_shm_header->words[IDX_MAGIC] != MAGIC ||
+       _shm_header->words[IDX_VERSION] != VERSION ||
+       _shm_header->words[IDX_HEADER_SIZE] != HEADER_SIZE)
+    {
+        throw std::runtime_error("py_bridge shm header/version mismatch");
+    }
+    if(_shm_header->words[IDX_TOTAL_SIZE] > _shm_size)
+    {
+        throw std::runtime_error("py_bridge shm size mismatch");
+    }
+    if(_shm_header->words[IDX_NJOINTS] != _joints.size() ||
+       _shm_header->words[IDX_NIMUS] != _imus.size())
+    {
+        throw std::runtime_error("py_bridge shm device count mismatch");
+    }
+    if(_shm_header->words[IDX_SERVER_SESSION_ID] != expected_server_session_id)
+    {
+        throw std::runtime_error("py_bridge shm server session mismatch");
+    }
+
+    _server_session_id = expected_server_session_id;
+    _client_session_id = generate_client_session_id();
+
+    // Announce this client session immediately, but leave the command frame
+    // invalid until move_all() publishes the first complete command.
+    _shm_header->words[IDX_CLIENT_SESSION_ID] = _client_session_id;
+    _shm_header->words[IDX_COMMAND_VALID] = 0;
+}
+
+void XBot::Hal::PyBridgeDeviceContainer::init_shm_views()
+{
+    using namespace PyBridgeShm;
+    auto * base = reinterpret_cast<uint8_t *>(_shm_addr);
+    auto * state = reinterpret_cast<double *>(base + _shm_header->words[IDX_STATE_OFFSET]);
+
+    // State layout: time, then joint arrays q/dq/tau/k/d/qref/vref/tauref,
+    // then per-IMU quat_w/lin_acc_b/ang_vel_b arrays.
+    _state_time = state;
+    state += 1;
+    for(size_t field = 0; field < STATE_FIELD_COUNT; field++)
+    {
+        _state_joint[field] = state;
+        state += _joints.size();
+    }
+
+    _state_imus.resize(_imus.size());
+    for(auto& imu : _state_imus)
+    {
+        imu.quat_w = state;
+        state += 4;
+        imu.lin_acc_b = state;
+        state += 3;
+        imu.ang_vel_b = state;
+        state += 3;
+    }
+
+    // Command layout mirrors Python's COMMAND_FIELDS: q/dq/tau/k/d.
+    auto * command = reinterpret_cast<double *>(base + _shm_header->words[IDX_COMMAND_OFFSET]);
+    for(size_t field = 0; field < COMMAND_FIELD_COUNT; field++)
+    {
+        _command_joint[field] = command;
+        command += _joints.size();
+    }
+
+    for(auto& field_tmp : _state_joint_tmp)
+    {
+        field_tmp.resize(_joints.size());
+    }
+    _state_imu_tmp.resize(_imus.size());
+}
+
+bool XBot::Hal::PyBridgeDeviceContainer::read_state_from_shm()
+{
+    using namespace PyBridgeShm;
+    if(!_shm_header)
     {
         return false;
     }
 
-    // keep only most recent
-    while(true)
+    const uint64_t seq1 = _shm_header->words[IDX_STATE_SEQ];
+
+    // No state has been published yet, or Python is currently writing one.
+    if(seq1 == 0 || (seq1 & 1))
     {
-        response_str.resize(40960);
-        if(!recv_string(response_str, false))
-        {
-            break;
-        }
+        return false;
     }
 
-    // parse json
-    nlohmann::json response = nlohmann::json::parse(response_str);
+    // Copy into scratch first. If the seqlock changes below, these bytes are
+    // discarded and existing device rx values remain untouched.
+    for(size_t field = 0; field < STATE_FIELD_COUNT; field++)
+    {
+        std::memcpy(_state_joint_tmp[field].data(),
+                    _state_joint[field],
+                    _joints.size()*sizeof(double));
+    }
 
-    // set response
-    _recv_json.set_value(response);
-    
-    // success
+    for(size_t i = 0; i < _state_imus.size(); i++)
+    {
+        std::memcpy(_state_imu_tmp[i].quat_w, _state_imus[i].quat_w, 4*sizeof(double));
+        std::memcpy(_state_imu_tmp[i].lin_acc_b, _state_imus[i].lin_acc_b, 3*sizeof(double));
+        std::memcpy(_state_imu_tmp[i].ang_vel_b, _state_imus[i].ang_vel_b, 3*sizeof(double));
+    }
+
+    const uint64_t seq2 = _shm_header->words[IDX_STATE_SEQ];
+
+    // Python published a newer frame while we were copying; try again next tick.
+    if(seq1 != seq2 || (seq2 & 1))
+    {
+        return false;
+    }
+
+    // Snapshot is stable, so it is now safe to update HAL rx structures.
+    for(size_t i = 0; i < _joints.size(); i++)
+    {
+        auto& rx = _joints[i]->rx();
+        rx.link_pos = rx.motor_pos = _state_joint_tmp[0][i];
+        rx.link_vel = rx.motor_vel = _state_joint_tmp[1][i];
+        rx.torque = _state_joint_tmp[2][i];
+        rx.gain_kp = _state_joint_tmp[3][i];
+        rx.gain_kd = _state_joint_tmp[4][i];
+        rx.pos_ref = _state_joint_tmp[5][i];
+        rx.vel_ref = _state_joint_tmp[6][i];
+        rx.tor_ref = _state_joint_tmp[7][i];
+    }
+
+    for(size_t i = 0; i < _imus.size(); i++)
+    {
+        auto& rx = _imus[i]->rx();
+        const auto& imu = _state_imu_tmp[i];
+        std::memcpy(rx.orientation, imu.quat_w, 4*sizeof(double));
+        std::memcpy(rx.linear_acceleration, imu.lin_acc_b, 3*sizeof(double));
+        std::memcpy(rx.angular_velocity, imu.ang_vel_b, 3*sizeof(double));
+    }
+
+    _last_state_seq = seq2;
     return true;
+}
 
+void XBot::Hal::PyBridgeDeviceContainer::sim_time_thread_main()
+{
+    this_thread::set_name("py_bridge");
+
+    uint64_t last_time_seq = 0;
+
+    while(_recv_thread_run.load())
+    {
+        if(!_shm_header)
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
+        }
+
+        // Use the same seqlock idea as sense_all(), but only read time. This
+        // thread exists because the control thread may sync on simulated_clock.
+        const uint64_t seq1 = _shm_header->words[PyBridgeShm::IDX_STATE_SEQ];
+        if(seq1 == 0 || (seq1 & 1) || seq1 == last_time_seq)
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
+        }
+
+        const double time = *_state_time;
+        const uint64_t seq2 = _shm_header->words[PyBridgeShm::IDX_STATE_SEQ];
+        if(seq1 != seq2 || (seq2 & 1))
+        {
+            continue;
+        }
+
+        if(!_time_initialized)
+        {
+            _time_initialized = true;
+            chrono::simulated_clock::initialize(std::chrono::nanoseconds(int64_t(time*1e9)));
+        }
+
+        chrono::simulated_clock::set_time(std::chrono::nanoseconds(int64_t(time*1e9)));
+        last_time_seq = seq2;
+    }
+
+    chrono::simulated_clock::enable_sim_time(false);
 }
 
 
@@ -386,6 +527,21 @@ XBot::Hal::PyBridgeDeviceContainer::~PyBridgeDeviceContainer()
     if(_recv_thread)
     {
         _recv_thread->join();       
+    }
+
+    if(_shm_addr)
+    {
+        munmap(_shm_addr, _shm_size);
+    }
+
+    if(_shm_fd >= 0)
+    {
+        close(_shm_fd);
+    }
+
+    if(_socket_fd >= 0)
+    {
+        close(_socket_fd);
     }
 }
 
