@@ -9,6 +9,7 @@ from .shm_protocol import ShmBridgeMemory
 
 @dataclass
 class JointCommand:
+    stamp_rx_feedback: np.uint64
     q: np.ndarray
     dq: np.ndarray
     tau: np.ndarray
@@ -63,9 +64,19 @@ def _from_dict(data, cls):
     """Recursively reconstruct a dataclass tree from a plain dict."""
     if is_dataclass(cls) and not isinstance(cls, type(None)):
         hints = get_type_hints(cls)
-        return cls(**{f.name: _from_dict(data[f.name], hints[f.name]) for f in fields(cls)})
+        kwargs = {}
+        for f in fields(cls):
+            if f.name in data:
+                kwargs[f.name] = _from_dict(data[f.name], hints[f.name])
+            elif f.name == "stamp_rx_feedback":
+                kwargs[f.name] = np.uint64(0)
+            else:
+                raise KeyError(f.name)
+        return cls(**kwargs)
     if cls is np.ndarray:
         return np.array(data)
+    if cls is np.uint64:
+        return np.uint64(data)
     if cls in (float, int, str, bool):
         return cls(data)
     origin = get_origin(cls)

@@ -20,6 +20,7 @@ from xbot2_py_bridge.bridge_server import (
 )
 from xbot2_py_bridge.shm_protocol import (
     COMMAND_FIELDS,
+    COMMAND_STAMP_RX_FEEDBACK_SIZE,
     HEADER_FORMAT,
     IDX_CLIENT_SESSION_ID,
     IDX_COMMAND_SEQ,
@@ -317,7 +318,11 @@ def _write_command(shm_name, server_session_id, client_session_id, values, *, st
         header[IDX_COMMAND_SEQ] = seq + 1
         struct_pack_header(shm.buf, header)
 
-        pos = command_offset
+        np.ndarray((), dtype=np.uint64, buffer=shm.buf, offset=command_offset)[...] = values.get(
+            "stamp_rx_feedback", 0
+        )
+
+        pos = command_offset + COMMAND_STAMP_RX_FEEDBACK_SIZE
         for field in COMMAND_FIELDS:
             arr = np.ndarray((N,), dtype=np.float64, buffer=shm.buf, offset=pos)
             arr[:] = values[field]
@@ -358,12 +363,15 @@ def test_shm_receive_accepts_fresh_current_session_command(tmp_path):
                 "tau": [4.0, 5.0, 6.0],
                 "k": [7.0, 8.0, 9.0],
                 "d": [10.0, 11.0, 12.0],
+                "stamp_rx_feedback": 123456789,
             },
         )
 
         assert srv._shm.has_new_command(1.0)
         np.testing.assert_array_equal(srv.command.joints.q, [1.0, 2.0, 3.0])
         np.testing.assert_array_equal(srv.command.joints.tau, [4.0, 5.0, 6.0])
+        assert int(srv.command.stamp_rx_feedback) == 123456789
+        assert int(srv.command.joints.stamp_rx_feedback) == 123456789
     finally:
         srv.close()
 

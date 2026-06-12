@@ -36,6 +36,7 @@ IDX_RESERVED1 = 15
 STATE_FIELDS = ("q", "dq", "tau", "k", "d", "qref", "vref", "tauref")
 COMMAND_FIELDS = ("q", "dq", "tau", "k", "d")
 IMU_FIELDS = (("quat_w", 4), ("lin_acc_b", 3), ("ang_vel_b", 3))
+COMMAND_STAMP_RX_FEEDBACK_SIZE = 8
 
 
 def _align(value: int, alignment: int = 64) -> int:
@@ -58,6 +59,10 @@ class ShmLayout:
     def command_doubles(self) -> int:
         return len(COMMAND_FIELDS) * self.njoints
 
+    @property
+    def command_bytes(self) -> int:
+        return COMMAND_STAMP_RX_FEEDBACK_SIZE + self.command_doubles * 8
+
 
 def make_layout(njoints: int, nimus: int) -> ShmLayout:
     # The state frame and command frame are separated by cache-line alignment so
@@ -65,7 +70,7 @@ def make_layout(njoints: int, nimus: int) -> ShmLayout:
     state_offset = HEADER_SIZE
     state_bytes = (1 + len(STATE_FIELDS) * njoints + sum(n for _, n in IMU_FIELDS) * nimus) * 8
     command_offset = _align(state_offset + state_bytes)
-    command_bytes = len(COMMAND_FIELDS) * njoints * 8
+    command_bytes = COMMAND_STAMP_RX_FEEDBACK_SIZE + len(COMMAND_FIELDS) * njoints * 8
     total_size = _align(command_offset + command_bytes)
     return ShmLayout(njoints, nimus, state_offset, command_offset, total_size)
 
@@ -80,6 +85,10 @@ class AttrDict(dict):
 
 def _array(buffer, offset: int, count: int) -> np.ndarray:
     return np.ndarray((count,), dtype=np.float64, buffer=buffer, offset=offset)
+
+
+def _uint64_scalar(buffer, offset: int) -> np.ndarray:
+    return np.ndarray((), dtype=np.uint64, buffer=buffer, offset=offset)
 
 
 def _make_joint_namespace(buffer, offset: int, names: tuple[str, ...], njoints: int):
@@ -160,10 +169,16 @@ class ShmBridgeMemory:
             imus[imu_name] = SimpleNamespace(**imu_arrays)
         self.state = SimpleNamespace(time=self.state_time, joints=state_joints, imus=imus)
 
+        self.command_stamp_rx_feedback = _uint64_scalar(self.shm.buf, self.layout.command_offset)
         command_joints, _ = _make_joint_namespace(
-            self.shm.buf, self.layout.command_offset, COMMAND_FIELDS, self.layout.njoints
+            self.shm.buf,
+            self.layout.command_offset + COMMAND_STAMP_RX_FEEDBACK_SIZE,
+            COMMAND_FIELDS,
+            self.layout.njoints,
         )
-        self.command = SimpleNamespace(joints=command_joints)
+        command_joints.stamp_rx_feedback = self.command_stamp_rx_feedback
+        self.command = SimpleNamespace(stamp_rx_feedback=self.command_stamp_rx_feedback,
+                                       joints=command_joints)
 
     def discovery_payload(self) -> dict:
         return {
@@ -248,7 +263,7 @@ class ShmBridgeMemory:
         self.state = None
         self.command = None
         self.state_time = None
-        self.state_joints = None
+        self.command_stamp_rx_feedback = None
         try:
             self.shm.close()
         except BufferError:

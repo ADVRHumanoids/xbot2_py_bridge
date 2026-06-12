@@ -25,6 +25,7 @@ constexpr size_t HEADER_WORDS = 16;
 constexpr size_t HEADER_SIZE = HEADER_WORDS * sizeof(uint64_t);
 constexpr size_t STATE_FIELD_COUNT = 8;
 constexpr size_t COMMAND_FIELD_COUNT = 5;
+constexpr size_t COMMAND_STAMP_RX_FEEDBACK_SIZE = sizeof(uint64_t);
 
 // Header words are uint64_t to keep the layout simple and naturally aligned.
 // STATE_SEQ and COMMAND_SEQ implement a seqlock: odd means "writer active",
@@ -188,10 +189,12 @@ private:
         const double * ang_vel_b = nullptr;
     };
     std::vector<ImuStateView> _state_imus;
+    uint64_t * _command_stamp_rx_feedback = nullptr;
     std::array<double *, PyBridgeShm::COMMAND_FIELD_COUNT> _command_joint{};
 
     // Scratch buffers let read_state_from_shm() validate the seqlock before
     // touching HAL device rx fields; torn reads are discarded cleanly.
+    double _state_time_tmp = 0.0;
     std::array<std::vector<double>, PyBridgeShm::STATE_FIELD_COUNT> _state_joint_tmp;
     struct ImuStateBuffer
     {

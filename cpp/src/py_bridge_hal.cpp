@@ -223,17 +223,27 @@ bool XBot::Hal::PyBridgeDeviceContainer::move_all()
 
     _shm_header->words[IDX_COMMAND_SEQ] = seq + 1;
 
-    // Fixed command frame order: q, dq, tau, k, d. We always publish full
-    // commands, so reconnects never depend on stale masked/partial values.
+    uint64_t stamp_rx_feedback = XBot::Hal::invalid_timestamp;
+
+    // Fixed command frame order: stamp_rx_feedback, then q/dq/tau/k/d. We
+    // always publish full commands, so reconnects never depend on stale
+    // masked/partial values.
     for(size_t i = 0; i < _joints.size(); i++)
     {
         auto& tx = _joints[i]->tx();
+        if(tx.stamp_rx_feedback != XBot::Hal::invalid_timestamp &&
+           (stamp_rx_feedback == XBot::Hal::invalid_timestamp ||
+            tx.stamp_rx_feedback < stamp_rx_feedback))
+        {
+            stamp_rx_feedback = tx.stamp_rx_feedback;
+        }
         _command_joint[0][i] = tx.pos_ref;
         _command_joint[1][i] = tx.vel_ref;
         _command_joint[2][i] = tx.tor_ref;
         _command_joint[3][i] = tx.gain_kp;
         _command_joint[4][i] = tx.gain_kd;
     }
+    *_command_stamp_rx_feedback = stamp_rx_feedback;
 
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
@@ -394,8 +404,11 @@ void XBot::Hal::PyBridgeDeviceContainer::init_shm_views()
         state += 3;
     }
 
-    // Command layout mirrors Python's COMMAND_FIELDS: q/dq/tau/k/d.
-    auto * command = reinterpret_cast<double *>(base + _shm_header->words[IDX_COMMAND_OFFSET]);
+    // Command layout mirrors Python's COMMAND_FIELDS: stamp_rx_feedback,
+    // then q/dq/tau/k/d.
+    auto * command_base = base + _shm_header->words[IDX_COMMAND_OFFSET];
+    _command_stamp_rx_feedback = reinterpret_cast<uint64_t *>(command_base);
+    auto * command = reinterpret_cast<double *>(command_base + COMMAND_STAMP_RX_FEEDBACK_SIZE);
     for(size_t field = 0; field < COMMAND_FIELD_COUNT; field++)
     {
         _command_joint[field] = command;
@@ -427,6 +440,8 @@ bool XBot::Hal::PyBridgeDeviceContainer::read_state_from_shm()
 
     // Copy into scratch first. If the seqlock changes below, these bytes are
     // discarded and existing device rx values remain untouched.
+    _state_time_tmp = *_state_time;
+
     for(size_t field = 0; field < STATE_FIELD_COUNT; field++)
     {
         std::memcpy(_state_joint_tmp[field].data(),
@@ -450,6 +465,8 @@ bool XBot::Hal::PyBridgeDeviceContainer::read_state_from_shm()
     }
 
     // Snapshot is stable, so it is now safe to update HAL rx structures.
+    const uint64_t stamp_ns = static_cast<uint64_t>(_state_time_tmp * 1e9);
+
     for(size_t i = 0; i < _joints.size(); i++)
     {
         auto& rx = _joints[i]->rx();
@@ -461,6 +478,7 @@ bool XBot::Hal::PyBridgeDeviceContainer::read_state_from_shm()
         rx.pos_ref = _state_joint_tmp[5][i];
         rx.vel_ref = _state_joint_tmp[6][i];
         rx.tor_ref = _state_joint_tmp[7][i];
+        rx.stamp = stamp_ns;
     }
 
     for(size_t i = 0; i < _imus.size(); i++)
@@ -651,6 +669,8 @@ bool XBot::Hal::JointDriver::sense_impl()
         _init_done = true;
     }
 
+    _tx.stamp_rx_feedback = XBot::Hal::invalid_timestamp;
+
     return true;
 }
 
@@ -669,8 +689,11 @@ bool XBot::Hal::JointDriver::move_impl()
         _tx_tmp = _tx;
     }
 
-    // note: reset mask before next tx msg received
+
+    // note: reset mask and stamps before next tx msg received
     _tx_tmp.mask = 0;
+    _tx_tmp.stamp_rx_feedback = XBot::Hal::invalid_timestamp;
+    _tx_tmp.stamp = XBot::Hal::invalid_timestamp;
 
     return true;
 }
