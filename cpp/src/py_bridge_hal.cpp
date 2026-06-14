@@ -15,6 +15,10 @@
 
 #include <xbot2_interface/xbotinterface2.h>
 
+#if XBOT2_MAJOR_VERSION >= 3
+#define HAS_MSG_STAMP_SUPPORT
+#endif
+
 XBot::Hal::PyBridgeDeviceContainer::PyBridgeDeviceContainer(std::vector<DeviceInfo> devinfo,
                                                   const Device::CommonParams &params)
     : DeviceContainerBase(), 
@@ -222,8 +226,11 @@ bool XBot::Hal::PyBridgeDeviceContainer::move_all()
     }
 
     _shm_header->words[IDX_COMMAND_SEQ] = seq + 1;
-
+#ifdef HAS_MSG_STAMP_SUPPORT
     uint64_t stamp_rx_feedback = XBot::Hal::invalid_timestamp;
+#else
+    uint64_t stamp_rx_feedback = 0;
+#endif
 
     // Fixed command frame order: stamp_rx_feedback, then q/dq/tau/k/d. We
     // always publish full commands, so reconnects never depend on stale
@@ -231,12 +238,14 @@ bool XBot::Hal::PyBridgeDeviceContainer::move_all()
     for(size_t i = 0; i < _joints.size(); i++)
     {
         auto& tx = _joints[i]->tx();
+#ifdef HAS_MSG_STAMP_SUPPORT
         if(tx.stamp_rx_feedback != XBot::Hal::invalid_timestamp &&
            (stamp_rx_feedback == XBot::Hal::invalid_timestamp ||
             tx.stamp_rx_feedback < stamp_rx_feedback))
         {
             stamp_rx_feedback = tx.stamp_rx_feedback;
         }
+#endif
         _command_joint[0][i] = tx.pos_ref;
         _command_joint[1][i] = tx.vel_ref;
         _command_joint[2][i] = tx.tor_ref;
@@ -478,7 +487,9 @@ bool XBot::Hal::PyBridgeDeviceContainer::read_state_from_shm()
         rx.pos_ref = _state_joint_tmp[5][i];
         rx.vel_ref = _state_joint_tmp[6][i];
         rx.tor_ref = _state_joint_tmp[7][i];
+#ifdef HAS_MSG_STAMP_SUPPORT
         rx.stamp = stamp_ns;
+#endif
     }
 
     for(size_t i = 0; i < _imus.size(); i++)
@@ -668,8 +679,9 @@ bool XBot::Hal::JointDriver::sense_impl()
 
         _init_done = true;
     }
-
+#ifdef HAS_MSG_STAMP_SUPPORT
     _tx.stamp_rx_feedback = XBot::Hal::invalid_timestamp;
+#endif
 
     return true;
 }
@@ -692,8 +704,10 @@ bool XBot::Hal::JointDriver::move_impl()
 
     // note: reset mask and stamps before next tx msg received
     _tx_tmp.mask = 0;
+#ifdef HAS_MSG_STAMP_SUPPORT
     _tx_tmp.stamp_rx_feedback = XBot::Hal::invalid_timestamp;
     _tx_tmp.stamp = XBot::Hal::invalid_timestamp;
+#endif
 
     return true;
 }
