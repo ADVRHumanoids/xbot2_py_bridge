@@ -27,3 +27,19 @@ import xbot2_py_bridge
 pip install -e ".[dev]"
 python -m pytest
 ```
+
+## Docker build test
+
+The build workflow uses forest inside the XBot2 development images for Ubuntu
+Noble (ROS 2 Jazzy) and Resolute (ROS 2 Lyrical). To run it locally:
+
+```bash
+cd docker/noble-ros2 # or docker/resolute-ros2
+docker compose up -d --build
+docker compose exec -T dev bash ./scripts/build.bash
+docker compose down --volumes
+```
+
+Set `FOREST_JOBS` before starting the container to change build parallelism
+(default: 1). The build uses the image's bundled XBot2 and builds the JSON
+dependency with forest; it does not fetch or build XBot2 from source.
